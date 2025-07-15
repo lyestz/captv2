@@ -1,0 +1,23 @@
+{
+  "name": "captcha-solver-server",
+  "version": "1.0.0",
+  "description": "A server to process and solve CAPTCHA images using Sharp and Tesseract.js.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "captcha",
+    "tesseract",
+    "sharp"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0",
+    "sharp": "^0.33.4",
+    "tesseract.js": "^5.1.0"
+  }
+}
