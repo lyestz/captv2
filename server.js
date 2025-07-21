@@ -14,9 +14,7 @@ async function initializeTesseractWorker() {
     console.log("Initializing Tesseract.js worker with local model...");
     try {
         const worker = await createWorker();
-        await worker.loadLanguage('eng', {
-            langPath: path.join(__dirname, 'tessdata')
-        });
+        await worker.loadLanguage('eng');
         await worker.initialize('eng');
         await worker.setParameters({
             tessedit_char_whitelist: '0123456789',
