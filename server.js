@@ -32,12 +32,13 @@ async function initializeTesseractWorker() {
     }
 }
 
-initializeTesseractWorker();
+const tesseractReadyPromise = initializeTesseractWorker();
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 app.post('/solve-captcha', async (req, res) => {
+    await tesseractReadyPromise;
     if (!isTesseractWorkerReady) {
         return res.status(503).json({ error: 'Server is still initializing. Please try again shortly.' });
     }
