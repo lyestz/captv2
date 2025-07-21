@@ -10,9 +10,9 @@ const app = express();
 let tesseractWorker;
 let isTesseractWorkerReady = false;
 
-// Tesseract.js worker initialization
+// Initialize Tesseract Worker
 async function initializeTesseractWorker() {
-    console.log("Initializing Tesseract.js worker with local model...");
+    console.log("Initializing Tesseract.js worker...");
     try {
         const worker = await createWorker();
         await worker.loadLanguage('eng', {
@@ -26,9 +26,9 @@ async function initializeTesseractWorker() {
         });
         tesseractWorker = worker;
         isTesseractWorkerReady = true;
-        console.log("SUCCESS: Tesseract.js worker initialized.");
+        console.log("Tesseract.js worker initialized successfully.");
     } catch (error) {
-        console.error("ERROR: Failed to initialize Tesseract.js worker.", error);
+        console.error("Failed to initialize Tesseract.js worker:", error);
         process.exit(1);
     }
 }
@@ -38,9 +38,10 @@ initializeTesseractWorker();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// Main OCR Endpoint
 app.post('/solve-captcha', async (req, res) => {
     if (!isTesseractWorkerReady) {
-        return res.status(503).json({ error: 'Server is still initializing. Please try again shortly.' });
+        return res.status(503).json({ error: 'Server is initializing. Try again shortly.' });
     }
 
     const { imageUrl } = req.body;
@@ -56,14 +57,16 @@ app.post('/solve-captcha', async (req, res) => {
             imageBuffer = Buffer.from(base64Data, 'base64');
         } else if (imageUrl.startsWith('http')) {
             const imageResponse = await fetch(imageUrl);
-            if (!imageResponse.ok) throw new Error(`Failed to fetch image. Status: ${imageResponse.statusText}`);
+            if (!imageResponse.ok) {
+                throw new Error(`Failed to fetch image. Status: ${imageResponse.statusText}`);
+            }
             imageBuffer = await imageResponse.buffer();
         } else {
-            throw new Error('Invalid imageUrl format.');
+            throw new Error('Invalid imageUrl format. Must be a data URL or http(s) URL.');
         }
 
         let sharpInstance = sharp(imageBuffer)
-            .resize({ width: 180 })
+            .resize({ width: 180 })  // You can tweak this
             .greyscale()
             .sharpen()
             .median(4);
@@ -71,6 +74,7 @@ app.post('/solve-captcha', async (req, res) => {
         const { data, info } = await sharpInstance.raw().toBuffer({ resolveWithObject: true });
         const { width, height } = info;
 
+        // Compute average gray value in center ROI
         const roiStartX = Math.floor(width * 0.25);
         const roiEndX = Math.floor(width * 0.75);
         const roiStartY = Math.floor(height * 0.25);
@@ -85,9 +89,8 @@ app.post('/solve-captcha', async (req, res) => {
             }
         }
 
-        const avgROIGray = roiCount > 0 ? roiSum / roiCount : 128;
-        const threshold = 128;
-        const numbersAreLighter = avgROIGray > threshold;
+        const avgGray = roiCount > 0 ? roiSum / roiCount : 128;
+        const numbersAreLighter = avgGray > 128;
 
         sharpInstance = sharp(data, {
             raw: {
@@ -97,17 +100,18 @@ app.post('/solve-captcha', async (req, res) => {
             }
         });
 
+        const threshold = otsuLike(data);
         let finalImageBuffer;
 
         if (numbersAreLighter) {
             finalImageBuffer = await sharpInstance
                 .negate()
-                .threshold(otsuLike(data))
+                .threshold(threshold)
                 .toFormat('png')
                 .toBuffer();
         } else {
             finalImageBuffer = await sharpInstance
-                .threshold(otsuLike(data))
+                .threshold(threshold)
                 .toFormat('png')
                 .toBuffer();
         }
@@ -115,39 +119,63 @@ app.post('/solve-captcha', async (req, res) => {
         const { data: { text } } = await tesseractWorker.recognize(finalImageBuffer);
         const cleanedText = text.replace(/[\s\D]/g, '');
 
-        console.log(`Raw Tesseract text: "${text.trim()}", Cleaned text: "${cleanedText}"`);
-        res.json({ text: cleanedText });
+        console.log(`Raw OCR: "${text.trim()}", Cleaned: "${cleanedText}"`);
+
+        if (!cleanedText) {
+            return res.status(422).json({ error: 'OCR completed, but no digits were detected.' });
+        }
+
+        return res.json({ text: cleanedText });
 
     } catch (error) {
         console.error("Error during CAPTCHA processing:", error);
-        res.status(500).json({ error: 'Failed to process the CAPTCHA image on the server.' });
+        return res.status(500).json({ error: 'Failed to process the CAPTCHA image.' });
     }
 });
 
+// Otsu Threshold Function
 function otsuLike(grayData) {
     const hist = new Array(256).fill(0);
     for (let i = 0; i < grayData.length; i++) {
         hist[grayData[i]]++;
     }
+
     let sum = 0;
-    for (let t = 0; t < 256; t++) sum += t * hist[t];
-    let sumB = 0, wB = 0, wF = 0, varMax = 0, threshold = 0;
+    for (let t = 0; t < 256; t++) {
+        sum += t * hist[t];
+    }
+
+    let sumB = 0, wB = 0, varMax = 0, threshold = 0;
     const total = grayData.length;
+
     for (let t = 0; t < 256; t++) {
         wB += hist[t];
         if (wB === 0) continue;
-        wF = total - wB;
+
+        const wF = total - wB;
         if (wF === 0) break;
+
         sumB += t * hist[t];
+
         const mB = sumB / wB;
         const mF = (sum - sumB) / wF;
+
         const betweenVar = wB * wF * (mB - mF) ** 2;
         if (betweenVar > varMax) {
             varMax = betweenVar;
             threshold = t;
         }
     }
+
     return threshold;
+}
+
+// Start server (optional, if run directly)
+if (require.main === module) {
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => {
+        console.log(`Server running at http://localhost:${PORT}`);
+    });
 }
 
 module.exports = app;
