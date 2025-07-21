@@ -3,7 +3,6 @@ const fetch = require('node-fetch');
 const sharp = require('sharp');
 const { createWorker } = require('tesseract.js');
 const cors = require('cors');
-const path = require('path');
 
 const app = express();
 
@@ -11,21 +10,21 @@ let tesseractWorker;
 let isTesseractWorkerReady = false;
 
 async function initializeTesseractWorker() {
-    console.log("Initializing Tesseract.js worker with local model...");
+    console.log("Initializing Tesseract.js worker...");
     try {
         const worker = await createWorker();
         await worker.loadLanguage('eng');
         await worker.initialize('eng');
         await worker.setParameters({
             tessedit_char_whitelist: '0123456789',
-            tessedit_pageseg_mode: 7,
-            oem: 3,
+            tessedit_pageseg_mode: '8', // single word/digit line mode (faster, accurate for captchas)
+            user_defined_dpi: '300',
         });
         tesseractWorker = worker;
         isTesseractWorkerReady = true;
-        console.log("SUCCESS: Tesseract.js worker initialized.");
-    } catch (error) {
-        console.error("ERROR: Failed to initialize Tesseract.js worker.", error);
+        console.log("Tesseract.js initialized.");
+    } catch (err) {
+        console.error("Failed to initialize Tesseract.js:", err);
         process.exit(1);
     }
 }
@@ -38,110 +37,113 @@ app.use(express.json({ limit: '10mb' }));
 app.post('/solve-captcha', async (req, res) => {
     await tesseractReadyPromise;
     if (!isTesseractWorkerReady) {
-        return res.status(503).json({ error: 'Server is still initializing. Please try again shortly.' });
+        return res.status(503).json({ error: 'OCR worker initializing.' });
     }
 
     const { imageUrl } = req.body;
     if (!imageUrl) {
-        return res.status(400).json({ error: 'imageUrl is required in the request body.' });
+        return res.status(400).json({ error: 'Missing imageUrl in request.' });
     }
 
     try {
         let imageBuffer;
 
+        // Handle Base64 or remote image
         if (imageUrl.startsWith('data:image')) {
-            const base64Data = imageUrl.split(',')[1];
-            imageBuffer = Buffer.from(base64Data, 'base64');
+            const base64 = imageUrl.split(',')[1];
+            imageBuffer = Buffer.from(base64, 'base64');
         } else if (imageUrl.startsWith('http')) {
-            const imageResponse = await fetch(imageUrl);
-            if (!imageResponse.ok) throw new Error(`Failed to fetch image. Status: ${imageResponse.statusText}`);
-            imageBuffer = await imageResponse.buffer();
+            const response = await fetch(imageUrl);
+            if (!response.ok) throw new Error(`Image fetch failed: ${response.statusText}`);
+            imageBuffer = await response.buffer();
         } else {
-            throw new Error('Invalid imageUrl format.');
+            throw new Error('Invalid image URL format.');
         }
 
-        let sharpInstance = sharp(imageBuffer)
+        // Preprocess: resize, greyscale, sharpen
+        const preprocessed = await sharp(imageBuffer)
             .resize({ width: 180 })
             .greyscale()
             .sharpen()
-            .median(4);
+            .median(3)
+            .raw()
+            .toBuffer({ resolveWithObject: true });
 
-        const { data, info } = await sharpInstance.raw().toBuffer({ resolveWithObject: true });
+        const { data: rawData, info } = preprocessed;
         const { width, height } = info;
 
-        const roiStartX = Math.floor(width * 0.25);
-        const roiEndX = Math.floor(width * 0.75);
-        const roiStartY = Math.floor(height * 0.25);
-        const roiEndY = Math.floor(height * 0.75);
+        // Detect brightness of center region (ROI)
+        const centerBox = {
+            x1: Math.floor(width * 0.25),
+            x2: Math.floor(width * 0.75),
+            y1: Math.floor(height * 0.25),
+            y2: Math.floor(height * 0.75)
+        };
 
-        let roiSum = 0;
-        let roiCount = 0;
-        for (let y = roiStartY; y < roiEndY; y++) {
-            for (let x = roiStartX; x < roiEndX; x++) {
-                roiSum += data[y * width + x];
-                roiCount++;
+        let sum = 0;
+        let count = 0;
+        for (let y = centerBox.y1; y < centerBox.y2; y++) {
+            for (let x = centerBox.x1; x < centerBox.x2; x++) {
+                sum += rawData[y * width + x];
+                count++;
             }
         }
+        const avgGray = count ? sum / count : 128;
+        const numbersAreLighter = avgGray > 128;
 
-        const avgROIGray = roiCount > 0 ? roiSum / roiCount : 128;
-        const threshold = 128;
-        const numbersAreLighter = avgROIGray > threshold;
-
-        sharpInstance = sharp(data, {
-            raw: {
-                width,
-                height,
-                channels: 1,
-            }
+        // Reconstruct sharp from raw, apply threshold (invert if needed)
+        let sharpImage = sharp(rawData, {
+            raw: { width, height, channels: 1 }
         });
 
-        let finalImageBuffer;
-
         if (numbersAreLighter) {
-            finalImageBuffer = await sharpInstance
-                .negate()
-                .threshold(otsuLike(data))
-                .toFormat('png')
-                .toBuffer();
-        } else {
-            finalImageBuffer = await sharpInstance
-                .threshold(otsuLike(data))
-                .toFormat('png')
-                .toBuffer();
+            sharpImage = sharpImage.negate();
         }
 
-        const { data: { text } } = await tesseractWorker.recognize(finalImageBuffer);
-        const cleanedText = text.replace(/[\s\D]/g, '');
+        const threshold = otsuThreshold(rawData);
+        const finalImageBuffer = await sharpImage
+            .threshold(threshold)
+            .toFormat('png')
+            .toBuffer();
 
-        console.log(`Raw Tesseract text: "${text.trim()}", Cleaned text: "${cleanedText}"`);
+        // OCR with Tesseract
+        const result = await tesseractWorker.recognize(finalImageBuffer);
+        const cleanedText = result.data.text.replace(/[^\d]/g, '');
+
+        console.log(`Detected: "${result.data.text.trim()}", Cleaned: "${cleanedText}"`);
         res.json({ text: cleanedText });
 
-    } catch (error) {
-        console.error("Error during CAPTCHA processing:", error);
-        res.status(500).json({ error: 'Failed to process the CAPTCHA image on the server.' });
+    } catch (err) {
+        console.error("CAPTCHA solve error:", err);
+        res.status(500).json({ error: 'OCR processing failed.' });
     }
 });
 
-function otsuLike(grayData) {
-    const hist = new Array(256).fill(0);
-    for (let i = 0; i < grayData.length; i++) {
-        hist[grayData[i]]++;
+function otsuThreshold(data) {
+    const hist = new Uint32Array(256);
+    let total = data.length, sum = 0;
+
+    for (let i = 0; i < total; i++) {
+        const val = data[i];
+        hist[val]++;
+        sum += val;
     }
-    let sum = 0;
-    for (let t = 0; t < 256; t++) sum += t * hist[t];
+
     let sumB = 0, wB = 0, wF = 0, varMax = 0, threshold = 0;
-    const total = grayData.length;
     for (let t = 0; t < 256; t++) {
         wB += hist[t];
         if (wB === 0) continue;
+
         wF = total - wB;
         if (wF === 0) break;
+
         sumB += t * hist[t];
         const mB = sumB / wB;
         const mF = (sum - sumB) / wF;
-        const betweenVar = wB * wF * (mB - mF) ** 2;
-        if (betweenVar > varMax) {
-            varMax = betweenVar;
+        const between = wB * wF * (mB - mF) ** 2;
+
+        if (between > varMax) {
+            varMax = between;
             threshold = t;
         }
     }
