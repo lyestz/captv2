@@ -3,7 +3,6 @@ const fetch = require('node-fetch');
 const sharp = require('sharp');
 const { createWorker } = require('tesseract.js');
 const cors = require('cors');
-const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -13,28 +12,28 @@ let isTesseractWorkerReady = false;
 
 // Tesseract.js worker initialization
 async function initializeTesseractWorker() {
-    console.log("Initializing Tesseract.js worker with local model...");
+    console.log("🔧 Initializing Tesseract.js worker...");
     try {
         const worker = await createWorker();
-        await worker.loadLanguage('eng', {
-            langPath: path.join(__dirname, '.'),
-        });
+
+        await worker.loadLanguage('eng'); // ✅ Removed langPath
         await worker.initialize('eng');
         await worker.setParameters({
             tessedit_char_whitelist: '0123456789',
             tessedit_pageseg_mode: 7,
             oem: 3,
         });
+
         tesseractWorker = worker;
         isTesseractWorkerReady = true;
-        console.log("✅ SUCCESS: Tesseract.js worker initialized. Server is ready.");
+        console.log("✅ Tesseract.js worker initialized and ready!");
     } catch (error) {
-        console.error("❌ ERROR: Failed to initialize Tesseract.js worker.", error);
+        console.error("❌ ERROR initializing Tesseract.js worker:", error);
         process.exit(1);
     }
 }
 
-// Start Tesseract init
+// Start initialization
 initializeTesseractWorker();
 
 app.use(cors());
@@ -101,16 +100,17 @@ app.post('/solve-captcha', async (req, res) => {
         });
 
         let finalImageBuffer;
+        const binaryThreshold = otsuLike(data);
 
         if (numbersAreLighter) {
             finalImageBuffer = await sharpInstance
                 .negate()
-                .threshold(otsuLike(data))
+                .threshold(binaryThreshold)
                 .toFormat('png')
                 .toBuffer();
         } else {
             finalImageBuffer = await sharpInstance
-                .threshold(otsuLike(data))
+                .threshold(binaryThreshold)
                 .toFormat('png')
                 .toBuffer();
         }
@@ -127,7 +127,7 @@ app.post('/solve-captcha', async (req, res) => {
     }
 });
 
-// Otsu threshold algorithm (simple version)
+// Simple Otsu-like thresholding function
 function otsuLike(grayData) {
     const hist = new Array(256).fill(0);
     for (let i = 0; i < grayData.length; i++) {
@@ -156,10 +156,11 @@ function otsuLike(grayData) {
             threshold = t;
         }
     }
+
     return threshold;
 }
 
-// Start server
+// Start the server
 app.listen(PORT, () => {
     console.log(`🚀 Server running at http://localhost:${PORT}`);
 });
