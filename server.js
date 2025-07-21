@@ -3,168 +3,150 @@ const fetch = require('node-fetch');
 const sharp = require('sharp');
 const { createWorker } = require('tesseract.js');
 const cors = require('cors');
+const path = require('path');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
 let tesseractWorker;
 let isTesseractWorkerReady = false;
 
-// ✅ Full CORS configuration
-const corsOptions = {
-  origin: '*', // Change to your frontend domain for more security
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type'],
-};
-
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions)); // Handle preflight requests
-
-app.use(express.json({ limit: '10mb' }));
-
-// Initialize Tesseract
 async function initializeTesseractWorker() {
-  console.log('🔧 Initializing Tesseract.js worker...');
-  try {
-    const worker = await createWorker();
-    await worker.loadLanguage('eng'); // ✅ Let it fetch model from CDN
-    await worker.initialize('eng');
-    await worker.setParameters({
-      tessedit_char_whitelist: '0123456789',
-      tessedit_pageseg_mode: 7,
-      oem: 3,
-    });
-
-    tesseractWorker = worker;
-    isTesseractWorkerReady = true;
-    console.log('✅ Tesseract worker initialized. Ready to process.');
-  } catch (error) {
-    console.error('❌ Tesseract initialization failed:', error);
-    process.exit(1);
-  }
+    console.log("Initializing Tesseract.js worker with local model...");
+    try {
+        const worker = await createWorker();
+        await worker.loadLanguage('eng', {
+            langPath: path.join(__dirname, '.'),
+        });
+        await worker.initialize('eng');
+        await worker.setParameters({
+            tessedit_char_whitelist: '0123456789',
+            tessedit_pageseg_mode: 7,
+            oem: 3,
+        });
+        tesseractWorker = worker;
+        isTesseractWorkerReady = true;
+        console.log("SUCCESS: Tesseract.js worker initialized.");
+    } catch (error) {
+        console.error("ERROR: Failed to initialize Tesseract.js worker.", error);
+        process.exit(1);
+    }
 }
 
 initializeTesseractWorker();
 
-// Health check route
-app.get('/status', (req, res) => {
-  res.json({ ready: isTesseractWorkerReady });
-});
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
 
-// Solve CAPTCHA
 app.post('/solve-captcha', async (req, res) => {
-  if (!isTesseractWorkerReady) {
-    return res.status(503).json({ error: 'Server is still initializing. Please try again shortly.' });
-  }
-
-  const { imageUrl } = req.body;
-  if (!imageUrl) {
-    return res.status(400).json({ error: 'imageUrl is required in the request body.' });
-  }
-
-  try {
-    let imageBuffer;
-
-    if (imageUrl.startsWith('data:image')) {
-      const base64Data = imageUrl.split(',')[1];
-      imageBuffer = Buffer.from(base64Data, 'base64');
-    } else if (imageUrl.startsWith('http')) {
-      const imageResponse = await fetch(imageUrl);
-      if (!imageResponse.ok) throw new Error(`Failed to fetch image: ${imageResponse.statusText}`);
-      imageBuffer = await imageResponse.buffer();
-    } else {
-      throw new Error('Invalid imageUrl format.');
+    if (!isTesseractWorkerReady) {
+        return res.status(503).json({ error: 'Server is still initializing. Please try again shortly.' });
     }
 
-    let sharpInstance = sharp(imageBuffer)
-      .resize({ width: 180 })
-      .greyscale()
-      .sharpen()
-      .median(4);
-
-    const { data, info } = await sharpInstance.raw().toBuffer({ resolveWithObject: true });
-    const { width, height } = info;
-
-    const roiStartX = Math.floor(width * 0.25);
-    const roiEndX = Math.floor(width * 0.75);
-    const roiStartY = Math.floor(height * 0.25);
-    const roiEndY = Math.floor(height * 0.75);
-
-    let roiSum = 0;
-    let roiCount = 0;
-    for (let y = roiStartY; y < roiEndY; y++) {
-      for (let x = roiStartX; x < roiEndX; x++) {
-        roiSum += data[y * width + x];
-        roiCount++;
-      }
+    const { imageUrl } = req.body;
+    if (!imageUrl) {
+        return res.status(400).json({ error: 'imageUrl is required in the request body.' });
     }
 
-    const avgROIGray = roiCount > 0 ? roiSum / roiCount : 128;
-    const threshold = 128;
-    const numbersAreLighter = avgROIGray > threshold;
+    try {
+        let imageBuffer;
 
-    sharpInstance = sharp(data, {
-      raw: { width, height, channels: 1 },
-    });
+        if (imageUrl.startsWith('data:image')) {
+            const base64Data = imageUrl.split(',')[1];
+            imageBuffer = Buffer.from(base64Data, 'base64');
+        } else if (imageUrl.startsWith('http')) {
+            const imageResponse = await fetch(imageUrl);
+            if (!imageResponse.ok) throw new Error(`Failed to fetch image. Status: ${imageResponse.statusText}`);
+            imageBuffer = await imageResponse.buffer();
+        } else {
+            throw new Error('Invalid imageUrl format.');
+        }
 
-    const otsuThreshold = otsuLike(data);
+        let sharpInstance = sharp(imageBuffer)
+            .resize({ width: 180 })
+            .greyscale()
+            .sharpen()
+            .median(4);
 
-    const finalImageBuffer = numbersAreLighter
-      ? await sharpInstance.negate().threshold(otsuThreshold).toFormat('png').toBuffer()
-      : await sharpInstance.threshold(otsuThreshold).toFormat('png').toBuffer();
+        const { data, info } = await sharpInstance.raw().toBuffer({ resolveWithObject: true });
+        const { width, height } = info;
 
-    const {
-      data: { text },
-    } = await tesseractWorker.recognize(finalImageBuffer);
+        const roiStartX = Math.floor(width * 0.25);
+        const roiEndX = Math.floor(width * 0.75);
+        const roiStartY = Math.floor(height * 0.25);
+        const roiEndY = Math.floor(height * 0.75);
 
-    const cleanedText = text.replace(/[\s\D]/g, '');
-    console.log(`🧠 OCR Result: Raw: "${text.trim()}" | Cleaned: "${cleanedText}"`);
+        let roiSum = 0;
+        let roiCount = 0;
+        for (let y = roiStartY; y < roiEndY; y++) {
+            for (let x = roiStartX; x < roiEndX; x++) {
+                roiSum += data[y * width + x];
+                roiCount++;
+            }
+        }
 
-    res.json({ text: cleanedText });
-  } catch (error) {
-    console.error('❌ CAPTCHA processing error:', error);
-    res.status(500).json({ error: 'Failed to process the CAPTCHA image on the server.' });
-  }
+        const avgROIGray = roiCount > 0 ? roiSum / roiCount : 128;
+        const threshold = 128;
+        const numbersAreLighter = avgROIGray > threshold;
+
+        sharpInstance = sharp(data, {
+            raw: {
+                width,
+                height,
+                channels: 1,
+            }
+        });
+
+        let finalImageBuffer;
+
+        if (numbersAreLighter) {
+            finalImageBuffer = await sharpInstance
+                .negate()
+                .threshold(otsuLike(data))
+                .toFormat('png')
+                .toBuffer();
+        } else {
+            finalImageBuffer = await sharpInstance
+                .threshold(otsuLike(data))
+                .toFormat('png')
+                .toBuffer();
+        }
+
+        const { data: { text } } = await tesseractWorker.recognize(finalImageBuffer);
+        const cleanedText = text.replace(/[\s\D]/g, '');
+
+        console.log(`Raw Tesseract text: "${text.trim()}", Cleaned text: "${cleanedText}"`);
+        res.json({ text: cleanedText });
+
+    } catch (error) {
+        console.error("Error during CAPTCHA processing:", error);
+        res.status(500).json({ error: 'Failed to process the CAPTCHA image on the server.' });
+    }
 });
 
-// Otsu-like thresholding function
 function otsuLike(grayData) {
-  const hist = new Array(256).fill(0);
-  for (let i = 0; i < grayData.length; i++) {
-    hist[grayData[i]]++;
-  }
-
-  let sum = 0;
-  for (let t = 0; t < 256; t++) sum += t * hist[t];
-
-  let sumB = 0,
-    wB = 0,
-    wF = 0,
-    varMax = 0,
-    threshold = 0;
-  const total = grayData.length;
-
-  for (let t = 0; t < 256; t++) {
-    wB += hist[t];
-    if (wB === 0) continue;
-    wF = total - wB;
-    if (wF === 0) break;
-
-    sumB += t * hist[t];
-    const mB = sumB / wB;
-    const mF = (sum - sumB) / wF;
-    const betweenVar = wB * wF * (mB - mF) ** 2;
-
-    if (betweenVar > varMax) {
-      varMax = betweenVar;
-      threshold = t;
+    const hist = new Array(256).fill(0);
+    for (let i = 0; i < grayData.length; i++) {
+        hist[grayData[i]]++;
     }
-  }
-
-  return threshold;
+    let sum = 0;
+    for (let t = 0; t < 256; t++) sum += t * hist[t];
+    let sumB = 0, wB = 0, wF = 0, varMax = 0, threshold = 0;
+    const total = grayData.length;
+    for (let t = 0; t < 256; t++) {
+        wB += hist[t];
+        if (wB === 0) continue;
+        wF = total - wB;
+        if (wF === 0) break;
+        sumB += t * hist[t];
+        const mB = sumB / wB;
+        const mF = (sum - sumB) / wF;
+        const betweenVar = wB * wF * (mB - mF) ** 2;
+        if (betweenVar > varMax) {
+            varMax = betweenVar;
+            threshold = t;
+        }
+    }
+    return threshold;
 }
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`🚀 Server is running at http://localhost:${PORT}`);
-});
+module.exports = app;
