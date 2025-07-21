@@ -15,7 +15,7 @@ async function initializeTesseractWorker() {
     try {
         const worker = await createWorker();
         await worker.loadLanguage('eng', {
-            langPath: path.join(__dirname),
+            langPath: path.join(__dirname, 'tessdata')
         });
         await worker.initialize('eng');
         await worker.setParameters({
